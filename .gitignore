@@ -1,0 +1,11 @@
+# Rapports et journaux générés par les scripts
+diagnostiques-reseaux_*.txt
+Infos-sante-disque_*.txt
+Infos-Systeme_*.txt
+system_overview_*.txt
+Infos-taches-planifiees_*.txt
+Reset-Reseau_*.log
+Reset-Reseau_*_config-avant.txt
+netsh-ipv*-reset_*.log
+EventLogs_*/
+EventLogs_*.zip
