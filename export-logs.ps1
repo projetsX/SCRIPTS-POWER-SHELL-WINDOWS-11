@@ -1,37 +1,83 @@
-<#
+﻿<#
 .SYNOPSIS
-  Exporte les journaux Windows récents dans un dossier compressé.
+  Exporte les journaux Windows récents (.evtx) dans une archive .zip horodatée.
 
 .PARAMETER Days
-  Nombre de jours à remonter (par défaut 7).
+  Nombre de jours à remonter (1 à 3650, par défaut 7).
+
+.PARAMETER LogName
+  Journaux à exporter. Par défaut : Application, System, Security.
+  Accepte aussi les journaux détaillés, ex : 'Microsoft-Windows-PowerShell/Operational'.
+
+.PARAMETER OutputPath
+  Dossier de destination. Par défaut le dossier du script.
+
+.PARAMETER KeepFolder
+  Conserve le dossier des .evtx non compressés après création de l'archive.
+
+.NOTES
+  Droits administrateur requis pour le journal Security.
+
+.EXAMPLE
+  .\export-logs.ps1 -Days 2 -LogName System, Application
 #>
 
+[CmdletBinding()]
 param(
-    [int]$Days = 7
+    [ValidateRange(1, 3650)]
+    [int]$Days = 7,
+
+    [ValidateNotNullOrEmpty()]
+    [string[]]$LogName = @('Application', 'System', 'Security'),
+
+    [string]$OutputPath = $PSScriptRoot,
+
+    [switch]$KeepFolder
 )
 
-if ($Days -lt 1) { $Days = 7 }
-
-If (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole] "Administrator")) {
-    Write-Error "Il faut exécuter ce script en tant qu'administrateur pour exporter les journaux de sécurité."
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin -and ($LogName -contains 'Security')) {
+    Write-Error "Droits administrateur requis pour exporter le journal Security. Relancez PowerShell en tant qu'administrateur ou retirez 'Security' de -LogName."
     exit 1
 }
 
-$since = (Get-Date).AddDays(-$Days)
-$timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$baseDir = "$scriptDir\EventLogs_$timestamp"
-New-Item -Path $baseDir -ItemType Directory -Force | Out-Null
+if (-not $OutputPath) { $OutputPath = (Get-Location).Path }
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$baseDir = Join-Path $OutputPath "EventLogs_$timestamp"
+$null = New-Item -Path $baseDir -ItemType Directory -Force
 
-$channels = @("Application","System","Security")
+# timediff() évite les problèmes de format de date dans la requête XPath
+$query = "*[System[TimeCreated[timediff(@SystemTime) <= $([int64]$Days * 86400000)]]]"
+$exported = 0
 
-foreach ($ch in $channels) {
-    $outfile = Join-Path $baseDir "$ch.evtx"
-    wevtutil epl $ch $outfile /q:"*[System[TimeCreated[@SystemTime>='$($since.ToUniversalTime().ToString("o"))']]]" 2>$null
-    if (Test-Path $outfile) { Write-Host "Exporté: $ch -> $outfile" } else { Write-Warning "Echec export $ch (peut-être pas d'events ou pas d'accès)." }
+foreach ($ch in $LogName) {
+    if (-not (Get-WinEvent -ListLog $ch -ErrorAction SilentlyContinue)) {
+        Write-Warning "Journal introuvable : $ch"
+        continue
+    }
+    $outfile = Join-Path $baseDir (($ch -replace '[\\/:*?"<>|]', '_') + '.evtx')
+    $output = & wevtutil.exe epl $ch $outfile "/q:$query" /ow:true 2>&1
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $outfile)) {
+        $sizeMB = [math]::Round((Get-Item -LiteralPath $outfile).Length / 1MB, 2)
+        Write-Host "Exporté : $ch -> $outfile ($sizeMB MB)" -ForegroundColor Green
+        $exported++
+    } else {
+        Write-Warning "Echec export $ch : $($output -join ' ')"
+    }
 }
 
-# compress
-$zip = "$scriptDir\EventLogs_$timestamp.zip"
-Compress-Archive -Path "$baseDir\*" -DestinationPath $zip -Force
-Write-Host "Archive créée: $zip"
+if ($exported -eq 0) {
+    Remove-Item -LiteralPath $baseDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Error 'Aucun journal exporté.'
+    exit 1
+}
+
+$zip = Join-Path $OutputPath "EventLogs_$timestamp.zip"
+try {
+    Compress-Archive -LiteralPath (Get-ChildItem -LiteralPath $baseDir).FullName -DestinationPath $zip -Force -ErrorAction Stop
+    Write-Host "Archive créée : $zip" -ForegroundColor Cyan
+    if (-not $KeepFolder) { Remove-Item -LiteralPath $baseDir -Recurse -Force }
+} catch {
+    Write-Error "Echec de la compression : $($_.Exception.Message). Les fichiers restent dans $baseDir"
+    exit 1
+}

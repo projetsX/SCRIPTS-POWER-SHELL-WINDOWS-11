@@ -1,74 +1,128 @@
-<#
+﻿<#
 .SYNOPSIS
-  Lance une série de checks réseau utiles : adaptateurs, DNS, route vers un host, traceroute.
-  Les résultats sont affichés en console et enregistrés dans un fichier .txt.
+  Lance une série de contrôles réseau : adaptateurs, IP, passerelle, DNS, connectivité, traceroute.
+  Les résultats sont affichés en console et enregistrés dans un fichier .txt horodaté.
 
 .PARAMETER HostToTest
-  Host de test (par défaut 8.8.8.8).
+  Hôte cible (nom DNS ou IP). Par défaut 8.8.8.8.
+
+.PARAMETER Port
+  Port TCP optionnel à tester sur l'hôte cible (ex : 443). Sans port, un ping ICMP est effectué.
+
+.PARAMETER DnsName
+  Nom utilisé pour tester la résolution DNS. Par défaut www.microsoft.com.
+
+.PARAMETER SkipTraceroute
+  Ne lance pas le traceroute (plus rapide).
+
+.PARAMETER OutputPath
+  Dossier du fichier de résultats. Par défaut le dossier du script.
+
+.EXAMPLE
+  .\diagnostiques-reseaux.ps1 -HostToTest github.com -Port 443
 #>
 
+[CmdletBinding()]
 param(
-  [string]$HostToTest = "8.8.8.8"
+  [ValidatePattern('^[A-Za-z0-9\.\-:]+$')]
+  [string]$HostToTest = '8.8.8.8',
+
+  [ValidateRange(1, 65535)]
+  [int]$Port,
+
+  [ValidatePattern('^[A-Za-z0-9\.\-]+$')]
+  [string]$DnsName = 'www.microsoft.com',
+
+  [switch]$SkipTraceroute,
+
+  [string]$OutputPath = $PSScriptRoot
 )
 
-# Créer le fichier de sortie avec horodatage
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-$logFile = Join-Path $scriptPath "diagnostiques-reseaux_$timestamp.txt"
+if (-not $OutputPath) { $OutputPath = (Get-Location).Path }
+$null = New-Item -Path $OutputPath -ItemType Directory -Force
+$logFile = Join-Path $OutputPath ("diagnostiques-reseaux_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-# Fonction pour afficher et enregistrer
-function Write-Output-And-Log {
-  param([string]$message, [string]$foregroundColor = "White")
-  Write-Host $message -ForegroundColor $foregroundColor
-  Add-Content -Path $logFile -Value $message -Encoding UTF8
+function Write-Log {
+  param([string]$Message = '', [ConsoleColor]$Color = 'White')
+  Write-Host $Message -ForegroundColor $Color
+  Add-Content -LiteralPath $logFile -Value $Message -Encoding UTF8
 }
 
-Write-Output-And-Log "=== DIAGNOSTIQUES RESEAU ===" "Cyan"
-Write-Output-And-Log "Généré le : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" "Gray"
-Write-Output-And-Log "Host de test : $HostToTest" "Gray"
-Write-Output-And-Log ""
-
-Write-Output-And-Log "--- NetAdapter ---" "Cyan"
-Get-NetAdapter | Select-Object Name, Status, LinkSpeed | Format-Table -AutoSize | Out-String | ForEach-Object {
-  if ($_.Trim()) {
-    Add-Content -Path $logFile -Value $_ -Encoding UTF8
-    Write-Host $_
+function Write-Block {
+  param([Parameter(ValueFromPipeline)]$InputObject)
+  begin { $items = @() }
+  process { $items += $InputObject }
+  end {
+    $text = ($items | Out-String -Width 4096).TrimEnd()
+    if ($text) {
+      Write-Host $text
+      Add-Content -LiteralPath $logFile -Value $text -Encoding UTF8
+    }
   }
 }
 
-Write-Output-And-Log "" 
-Write-Output-And-Log "--- IP Configuration ---" "Cyan"
-Get-NetIPAddress -AddressFamily IPv4 | Format-Table InterfaceAlias, IPAddress, PrefixLength | Out-String | ForEach-Object {
-  if ($_.Trim()) {
-    Add-Content -Path $logFile -Value $_ -Encoding UTF8
-    Write-Host $_
+Write-Log '=== DIAGNOSTICS RESEAU ===' Cyan
+Write-Log "Généré le : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" Gray
+Write-Log "Hôte de test : $HostToTest$(if ($Port) { ":$Port" })" Gray
+Write-Log
+
+Write-Log '--- Adaptateurs réseau ---' Cyan
+Get-NetAdapter | Sort-Object Status, Name |
+  Select-Object Name, InterfaceDescription, Status, LinkSpeed, MacAddress |
+  Format-Table -AutoSize | Write-Block
+
+Write-Log
+Write-Log '--- Adresses IPv4 ---' Cyan
+Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.IPAddress -notlike '127.*' } |
+  Select-Object InterfaceAlias, IPAddress, PrefixLength, PrefixOrigin |
+  Format-Table -AutoSize | Write-Block
+
+Write-Log
+Write-Log '--- Passerelle(s) par défaut ---' Cyan
+$gateways = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric
+if ($gateways) {
+  foreach ($gw in $gateways) {
+    $reachable = Test-Connection -ComputerName $gw.NextHop -Count 2 -Quiet -ErrorAction SilentlyContinue
+    $color = if ($reachable) { 'Green' } else { 'Red' }
+    Write-Log ("{0} via {1} (métrique {2}) : {3}" -f $gw.InterfaceAlias, $gw.NextHop, $gw.RouteMetric, $(if ($reachable) { 'joignable' } else { 'injoignable' })) $color
   }
+} else {
+  Write-Log 'Aucune passerelle par défaut configurée.' Red
 }
 
-Write-Output-And-Log ""
-Write-Output-And-Log "--- DNS Servers ---" "Cyan"
-Get-DnsClientServerAddress | Select-Object InterfaceAlias, ServerAddresses | Format-Table -AutoSize | Out-String | ForEach-Object {
-  if ($_.Trim()) {
-    Add-Content -Path $logFile -Value $_ -Encoding UTF8
-    Write-Host $_
-  }
+Write-Log
+Write-Log '--- Serveurs DNS ---' Cyan
+Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.ServerAddresses } |
+  Select-Object InterfaceAlias, @{ Name = 'ServerAddresses'; Expression = { $_.ServerAddresses -join ', ' } } |
+  Format-Table -AutoSize | Write-Block
+
+Write-Log
+Write-Log "--- Résolution DNS de $DnsName ---" Cyan
+try {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $answers = Resolve-DnsName -Name $DnsName -DnsOnly -ErrorAction Stop | Where-Object { $_.Type -in 'A', 'AAAA' }
+  $sw.Stop()
+  Write-Log ("Résolu en {0} ms : {1}" -f $sw.ElapsedMilliseconds, (($answers.IPAddress | Select-Object -Unique) -join ', ')) Green
+} catch {
+  Write-Log "ECHEC de la résolution : $($_.Exception.Message)" Red
 }
 
-Write-Output-And-Log ""
-Write-Output-And-Log "--- Test-NetConnection (TCP) vers $HostToTest ---" "Cyan"
-Test-NetConnection -ComputerName $HostToTest -InformationLevel Detailed | Out-String | ForEach-Object {
-  if ($_.Trim()) {
-    Add-Content -Path $logFile -Value $_ -Encoding UTF8
-    Write-Host $_
-  }
+Write-Log
+if ($Port) {
+  Write-Log "--- Test TCP vers ${HostToTest}:$Port ---" Cyan
+  Test-NetConnection -ComputerName $HostToTest -Port $Port -InformationLevel Detailed -WarningAction SilentlyContinue | Write-Block
+} else {
+  Write-Log "--- Test ICMP (ping) vers $HostToTest ---" Cyan
+  Test-NetConnection -ComputerName $HostToTest -InformationLevel Detailed -WarningAction SilentlyContinue | Write-Block
 }
 
-Write-Output-And-Log ""
-Write-Output-And-Log "--- Traceroute vers $HostToTest ---" "Cyan"
-tracert $HostToTest | ForEach-Object {
-  Add-Content -Path $logFile -Value $_ -Encoding UTF8
-  Write-Host $_
+if (-not $SkipTraceroute) {
+  Write-Log
+  Write-Log "--- Traceroute vers $HostToTest (sans résolution de noms) ---" Cyan
+  & tracert.exe -d -w 1000 $HostToTest | ForEach-Object { Write-Log $_ }
 }
 
-Write-Output-And-Log ""
-Write-Output-And-Log "Fichier enregistré : $logFile" "Gray"
+Write-Log
+Write-Log "Fichier enregistré : $logFile" Gray

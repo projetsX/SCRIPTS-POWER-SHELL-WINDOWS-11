@@ -1,94 +1,144 @@
-<#
+﻿<#
 .SYNOPSIS
-  Récupère l'état SMART et l'espace disque.
-  Les résultats sont affichés en console et enregistrés dans un fichier .txt.
+  Récupère l'état de santé des disques (espace, état physique, compteurs de fiabilité, SMART).
+  Les résultats sont affichés en console et enregistrés dans un fichier .txt horodaté.
+
+.PARAMETER OutputPath
+  Dossier du fichier de résultats. Par défaut le dossier du script.
+
+.PARAMETER WarnPercent
+  Seuil d'occupation (%) déclenchant une alerte sur un volume. Par défaut 90.
 
 .NOTES
-  Exécuter en tant qu'administrateur pour de meilleurs résultats.
+  Exécuter en tant qu'administrateur pour les compteurs de fiabilité et les données SMART.
 #>
 
-# Créer le fichier de sortie avec horodatage
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-$logFile = Join-Path $scriptPath "Infos-sante-disque_$timestamp.txt"
+[CmdletBinding()]
+param(
+    [string]$OutputPath = $PSScriptRoot,
 
-# Fonction pour afficher et enregistrer
-function Write-Output-And-Log {
-    param([string]$message, [string]$foregroundColor = "White")
-    Write-Host $message -ForegroundColor $foregroundColor
-    Add-Content -Path $logFile -Value $message -Encoding UTF8
+    [ValidateRange(1, 100)]
+    [int]$WarnPercent = 90
+)
+
+if (-not $OutputPath) { $OutputPath = (Get-Location).Path }
+$null = New-Item -Path $OutputPath -ItemType Directory -Force
+$logFile = Join-Path $OutputPath ("Infos-sante-disque_{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+
+function Write-Log {
+    param([string]$Message = '', [ConsoleColor]$Color = 'White')
+    Write-Host $Message -ForegroundColor $Color
+    Add-Content -LiteralPath $logFile -Value $Message -Encoding UTF8
 }
 
-# Vérifier les droits administrateur
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
-if (-not $isAdmin) {
-    Write-Output-And-Log "AVERTISSEMENT: Script exécuté sans droits administrateur. Certaines informations SMART peuvent ne pas être disponibles." "Yellow"
-    Write-Output-And-Log ""
-}
-
-# === ESPACE DISQUE ===
-Write-Output-And-Log "=== INFORMATIONS SANTE DISQUE ===" "Cyan"
-Write-Output-And-Log "Généré le : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" "Gray"
-Write-Output-And-Log ""
-Write-Output-And-Log "=== VOLUMES DISQUE ===" "Cyan"
-Write-Output-And-Log ""
-
-$volumes = Get-Volume | Where-Object { $_.DriveLetter } | Select-Object `
-    DriveLetter, 
-    FileSystemLabel, 
-    FileSystem,
-    @{Name='LibreGB'; Expression={[math]::Round($_.SizeRemaining / 1GB, 2)}},
-    @{Name='TotalGB'; Expression={[math]::Round($_.Size / 1GB, 2)}},
-    @{Name='%Utilisé'; Expression={
-        if ($_.Size -gt 0) {
-            [math]::Round((($_.Size - $_.SizeRemaining) / $_.Size) * 100, 1)
-        } else {
-            0
-        }
-    }}
-
-if ($volumes) {
-    $volumes | Format-Table -AutoSize | Out-String | ForEach-Object {
-        if ($_.Trim()) {
-            Add-Content -Path $logFile -Value $_ -Encoding UTF8
-            Write-Host $_
+function Write-Block {
+    param([Parameter(ValueFromPipeline)]$InputObject)
+    begin { $items = @() }
+    process { $items += $InputObject }
+    end {
+        $text = ($items | Out-String -Width 4096).TrimEnd()
+        if ($text) {
+            Write-Host $text
+            Add-Content -LiteralPath $logFile -Value $text -Encoding UTF8
         }
     }
-} else {
-    Write-Output-And-Log "AVERTISSEMENT: Aucun volume avec lettre de lecteur trouvé." "Yellow"
 }
 
-Write-Output-And-Log ""
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# === INFORMATIONS SMART ===
-Write-Output-And-Log "=== INFORMATIONS SMART ===" "Cyan"
-Write-Output-And-Log ""
+Write-Log '=== INFORMATIONS SANTE DISQUE ===' Cyan
+Write-Log "Généré le : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" Gray
+if (-not $isAdmin) {
+    Write-Log 'AVERTISSEMENT : exécuté sans droits administrateur. Compteurs de fiabilité et SMART probablement indisponibles.' Yellow
+}
+Write-Log
 
+# === VOLUMES ===
+Write-Log '=== VOLUMES ===' Cyan
+$volumes = Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | Sort-Object DriveLetter | Select-Object `
+    DriveLetter,
+    FileSystemLabel,
+    FileSystem,
+    HealthStatus,
+    @{ Name = 'LibreGB'; Expression = { [math]::Round($_.SizeRemaining / 1GB, 2) } },
+    @{ Name = 'TotalGB'; Expression = { [math]::Round($_.Size / 1GB, 2) } },
+    @{ Name = '%Utilisé'; Expression = { [math]::Round((($_.Size - $_.SizeRemaining) / $_.Size) * 100, 1) } }
+
+if ($volumes) {
+    $volumes | Format-Table -AutoSize | Write-Block
+    foreach ($v in $volumes | Where-Object { $_.'%Utilisé' -ge $WarnPercent }) {
+        Write-Log ("ALERTE : le volume {0}: est rempli à {1} %." -f $v.DriveLetter, $v.'%Utilisé') Red
+    }
+} else {
+    Write-Log 'AVERTISSEMENT : aucun volume avec lettre de lecteur trouvé.' Yellow
+}
+Write-Log
+
+# === DISQUES PHYSIQUES ===
+Write-Log '=== DISQUES PHYSIQUES ===' Cyan
+$disks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | Sort-Object { [int]$_.DeviceId })
+if ($disks) {
+    $disks | Select-Object DeviceId, FriendlyName, MediaType, BusType,
+        @{ Name = 'TailleGB'; Expression = { [math]::Round($_.Size / 1GB, 0) } },
+        HealthStatus, OperationalStatus |
+        Format-Table -AutoSize | Write-Block
+    foreach ($d in $disks | Where-Object { "$($_.HealthStatus)" -ne 'Healthy' }) {
+        Write-Log ("ALERTE : disque {0} ({1}) état {2} / {3}" -f $d.DeviceId, $d.FriendlyName, $d.HealthStatus, ($d.OperationalStatus -join ', ')) Red
+    }
+} else {
+    Write-Log 'Aucun disque physique détecté.' Yellow
+}
+Write-Log
+
+# === COMPTEURS DE FIABILITE (NVMe et SATA) ===
+Write-Log '=== COMPTEURS DE FIABILITE ===' Cyan
+$counters = foreach ($d in $disks) {
+    $c = $d | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+    if ($c) {
+        [PSCustomObject]@{
+            DeviceId          = $d.DeviceId
+            Disque            = $d.FriendlyName
+            'Temp(C)'         = $c.Temperature
+            'TempMax(C)'      = $c.TemperatureMax
+            'Usure(%)'        = $c.Wear
+            HeuresMarche      = $c.PowerOnHours
+            ErreursLectureNC  = $c.ReadErrorsUncorrected
+            ErreursEcritureNC = $c.WriteErrorsUncorrected
+        }
+    }
+}
+if ($counters) {
+    $counters | Format-Table -AutoSize | Write-Block
+    Write-Log 'Usure : pourcentage de durée de vie consommée (SSD). NC = non corrigées.' Gray
+} elseif ($isAdmin) {
+    Write-Log 'Compteurs de fiabilité non fournis par les contrôleurs de ce système.' Yellow
+} else {
+    Write-Log 'Compteurs de fiabilité indisponibles : droits administrateur requis.' Yellow
+}
+Write-Log
+
+# === PREDICTION SMART (WMI) ===
+Write-Log '=== PREDICTION DE PANNE SMART ===' Cyan
 try {
-    $smart = Get-WmiObject -Namespace root\wmi -Class MSStorageDriver_FailurePredictStatus -ErrorAction Stop
-    
+    $smart = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
     if ($smart) {
         foreach ($s in $smart) {
-            $dev = $s.InstanceName
-            $status = if ($s.PredictFailure -eq $false) { "OK" } else { "ALERTE" }
-            $couleur = if ($s.PredictFailure -eq $false) { "Green" } else { "Red" }
-            
-            Write-Output-And-Log "Périphérique: $dev" "White"
-            Write-Output-And-Log "État: $status" $couleur
-            Write-Output-And-Log "Risque d'échec: $($s.PredictFailure)" "Gray"
-            Write-Output-And-Log ""
+            if ($s.PredictFailure) {
+                Write-Log ("{0} : ALERTE - panne prédite (code {1})" -f $s.InstanceName, $s.Reason) Red
+            } else {
+                Write-Log ("{0} : OK" -f $s.InstanceName) Green
+            }
         }
     } else {
-        Write-Output-And-Log "Aucun disque SMART détecté." "Yellow"
+        Write-Log 'Aucun disque ne remonte de statut SMART via WMI.' Yellow
     }
 } catch {
     if ($isAdmin) {
-        Write-Output-And-Log "AVERTISSEMENT: Impossible d'interroger SMART via WMI sur ce système." "Yellow"
-        Write-Output-And-Log "Cause possible: WMI non configuré ou contrôleur non supporté." "Yellow"
+        Write-Log 'SMART non disponible via WMI (fréquent avec NVMe ou contrôleurs RAID) : voir les compteurs de fiabilité ci-dessus.' Yellow
     } else {
-        Write-Output-And-Log "AVERTISSEMENT: Droits insuffisants pour interroger SMART. Veuillez exécuter en tant qu'administrateur." "Yellow"
+        Write-Log 'Droits insuffisants pour interroger SMART. Exécutez le script en tant qu''administrateur.' Yellow
     }
 }
 
-Write-Output-And-Log ""
-Write-Output-And-Log "Fichier enregistré : $logFile" "Gray"
+Write-Log
+Write-Log "Fichier enregistré : $logFile" Gray
